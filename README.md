@@ -23,7 +23,7 @@ In this repo you can find:
 	* FreeBSD 10-stable
 	* FreeBSD 9-stable
  * a simple application that prints the GSO statistics:
-	* gso-stat.c
+	* [gso-stat.c](https://github.com/stefano-garzarella/freebsd-gso/blob/master/utilities/gso-stats.c)
 
 In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
 
