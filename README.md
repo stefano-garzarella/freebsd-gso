@@ -25,8 +25,6 @@ In this repo you can find:
  * a simple application that prints the GSO statistics:
 	* gso-stat.c
 
-===========
-
 ##How to use GSO
 
 * Apply the right kernel patch.
@@ -47,8 +45,6 @@ In this repo you can find:
 * To show statistics:
      make sure that the GSO_STATS macro is defined in sys/net/gso.h
      use the simple gso-stats.c application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
-
-===========
 
 ##Experiments
 
