@@ -18,12 +18,16 @@ Our preliminary implementation, depending on CPU speed, shows up to 95% speedup 
 ##Patches & utilities
 
 In this repo you can find: 
- * the kernel patches for
+ * kernel patches for
 	* FreeBSD-current
 	* FreeBSD 10-stable
 	* FreeBSD 9-stable
- * a simple application that prints the GSO statistics:
+ * simple application that prints the GSO statistics:
 	* [gso-stat.c](https://github.com/stefano-garzarella/freebsd-gso/blob/master/utilities/gso-stats.c)
+ * picobsd images:
+ 	* PicoBSD-current
+	* PicoBSD 10-stable
+	* PicoBSD 9-stable 
 
 In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
 
