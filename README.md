@@ -5,13 +5,13 @@ The use of large frames makes network communication much less demanding for the 
 Modern NICs with hardware TCP segmentation offloading (TSO) address this problem. However, a generic software version (GSO) provided by the OS has reason to exist, for use on paths with no suitable hardware, such as between virtual machines or with older or buggy NICs.
 
 A lot of the savings is provided by crossing the network stack once rather than many times for each large packet, but this saving can be obtained without hardware support. In addition, this mechanism can also be extended to protocols that require IP fragmentation, such as UDP.
-The idea to reduce the CPU overhead is to postpone the TCP segmentation or IP fragmentation as late as possible. A solution would be to perform the segmentation within the device driver, but this requires changing every device driver. Therefore, the best solution is to segment just before the packet is passed to the driver (in <code>ether_output()</code>).
+In order to reduce the CPU overhead, the idea is to postpone the TCP segmentation or IP fragmentation as late as possible. This goal can be reached performing the segmentation within the device driver, but this requires changing every device driver. Therefore, the best approach is to segment just before the packet is passed to the driver (in <code>ether_output()</code>).
 
 This preliminary implementation supports TCP, UDP on IPv4/IPv6.
-In the TCP case, when a packet is created, if the GSO is active, it may be larger than the MTU, in this case the super-packet is marked with a flag (contained in <code>m_pkthdr.csum_flags</code>) to make sure that this is divided into smaller packets just before calling the device driver. In this way the functions that create the headers for layers TCP, IP and Ethernet are crossed once. Finally, the super-packet headers are copied and adjusted in all packets after performing the segmentation of the payload. 
-A TCP packet can be divided into smaller packets without performing IP fragmentation, because TCP is a stream-oriented protocol. Instead, in the UDP case, IP fragmentation is required. However, also in this case, the fragmentation can be delayed and performed just before calling the device driver. In this way, the MAC layer is traversed only once, and the MAC header, the same for all, is simply copied into all fragments.
+For TCP, when a packet is created, if the GSO is active, it may be larger than the MTU, in this case the super-packet is marked with a flag (contained in <code>m_pkthdr.csum_flags</code>)  which guarantees that it is divided into smaller packets just before calling the device driver. In this way the functions that create the headers for layers TCP, IP and Ethernet are crossed once. Finally, the super-packet headers are copied and adjusted in all packets after performing the segmentation of the payload. 
+A TCP packet can be divided into smaller packets without performing IP fragmentation, because TCP is a stream-oriented protocol. Instead, for UDP, IP fragmentation is required. However, also in this case, the fragmentation can be delayed and performed just before calling the device driver. In this way, the Ethernet layer is traversed only once, and the Ethernet header, the same for all, is simply copied into all fragments.
 
-The experiments performed with TCP provide significant results if the receiver is able to perform aggregation hardware or software (RSS or LRO). We also noticed that by lowering the clock frequency of the transmitter, the speedup increases. This occurs because with maximum frequency, the system is able to saturate the link. Also with UDP traffic, we can notice a speedup given by the GSO.
+The experiments performed with TCP provide significant results if the receiver can perform aggregation hardware or software (RSC or LRO). We also noticed that by lowering the clock frequency of the transmitter, the speedup increases. This occurs because with maximum frequency, the system is able to saturate the link. Also with UDP traffic, we can notice a speedup given by the GSO.
 
 Our preliminary implementation, depending on CPU speed, shows up to 95% speedup compared to segmentation done in the TCP/IPv4 stack, saturating a 10 Gbit link at 2 GHz with checksum offloading [Tab. 1].
 
@@ -23,7 +23,7 @@ In this repo you can find:
 	* FreeBSD 10-stable
 	* FreeBSD 9-stable
  * a simple application that prints the GSO statistics:
-	* gso-stat.c
+	* [gso-stat.c](https://github.com/stefano-garzarella/freebsd-gso/blob/master/utilities/gso-stats.c)
 
 In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
 
@@ -45,8 +45,8 @@ In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD
           * **net.gso.dev."ifname”.enable_gso** - GSO enable on “ifname” interface (!=0)
 
 * To show statistics:
-     make sure that the GSO_STATS macro is defined in sys/net/gso.h
-     use the simple gso-stats.c application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
+     * make sure that the GSO_STATS macro is defined in sys/net/gso.h
+     * use the simple [gso-stat.c](https://github.com/stefano-garzarella/freebsd-gso/blob/master/utilities/gso-stats.c) application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
 
 ##Experiments
 
