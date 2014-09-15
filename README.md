@@ -45,8 +45,8 @@ In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD
           * **net.gso.dev."ifname”.enable_gso** - GSO enable on “ifname” interface (!=0)
 
 * To show statistics:
-     make sure that the GSO_STATS macro is defined in sys/net/gso.h
-     use the simple gso-stats.c application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
+     * make sure that the GSO_STATS macro is defined in sys/net/gso.h
+     * use the simple gso-stats.c application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
 
 ##Experiments
 
