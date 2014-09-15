@@ -52,6 +52,15 @@ In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD
      * make sure that the GSO_STATS macro is defined in sys/net/gso.h
      * use the simple [gso-stat.c](https://github.com/stefano-garzarella/freebsd-gso/blob/master/utilities/gso-stats.c) application to access the sysctl net.gso.stats that contains the address of the gsostats structure (defined in gso.h) which records the statistics. (compile with -I/path/to/kernel/src/patched/)
 
+##How to use PicoBSD image with GSO
+
+* Real Machine
+	* Copy the PicoBSD image on a usb-stick
+		* sudo dd if=picobsd.bin of=/dev/rdisk1 bs=1m
+	* Plug the usb-stick into a real machine
+	* Turn it on
+* Virtual Machine
+
 ##Experiments
 
 * Test Date: Sep 9, 2014
