@@ -25,6 +25,8 @@ In this repo you can find:
  * a simple application that prints the GSO statistics:
 	* gso-stat.c
 
+In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
+
 ##How to use GSO
 
 * Apply the right kernel patch.
