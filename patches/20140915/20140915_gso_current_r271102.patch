@@ -1,0 +1,1890 @@
+diff --git a/sys/conf/NOTES b/sys/conf/NOTES
+index 98788e0..fe73484 100644
+--- a/sys/conf/NOTES
++++ b/sys/conf/NOTES
+@@ -587,6 +587,8 @@ options 	ROUTETABLES=2		# allocated fibs up to 65536. default is 1.
+ 
+ options 	TCP_OFFLOAD		# TCP offload support.
+ 
++options		GSO			# Generic Segmentation Offload support.
++
+ # In order to enable IPSEC you MUST also add device crypto to 
+ # your kernel configuration
+ options 	IPSEC			#IP security (requires device crypto)
+diff --git a/sys/conf/files b/sys/conf/files
+index 458a88e..98bff11 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -3240,6 +3240,7 @@ net/if_stf.c			optional stf inet inet6
+ net/if_tun.c			optional tun
+ net/if_tap.c			optional tap
+ net/if_vlan.c			optional vlan
++net/gso.c			optional gso inet
+ net/mppcc.c			optional netgraph_mppc_compression
+ net/mppcd.c			optional netgraph_mppc_compression
+ net/netisr.c			standard
+diff --git a/sys/conf/options b/sys/conf/options
+index eff8a12..2487ba2 100644
+--- a/sys/conf/options
++++ b/sys/conf/options
+@@ -442,6 +442,7 @@ VLAN_ARRAY		opt_vlan.h
+ XBONEHACK
+ FLOWTABLE		opt_route.h
+ FLOWTABLE_HASH_ALL	opt_route.h
++GSO			opt_inet.h # Enable Generic Segmantation Offload
+ 
+ #
+ # SCTP
+diff --git a/sys/net/gso.c b/sys/net/gso.c
+new file mode 100644
+index 0000000..265bf1e
+--- /dev/null
++++ b/sys/net/gso.c
+@@ -0,0 +1,1020 @@
++/*
++ * Copyright (C) 2014, Stefano Garzarella - Universita` di Pisa.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *   1. Redistributions of source code must retain the above copyright
++ *      notice, this list of conditions and the following disclaimer.
++ *   2. Redistributions in binary form must reproduce the above copyright
++ *      notice, this list of conditions and the following disclaimer in the
++ *      documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include "opt_inet6.h"
++
++#include <net/gso.h>
++
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/types.h>
++#include <sys/systm.h>
++#include <sys/mbuf.h>
++#include <sys/socket.h>
++#include <sys/sysctl.h>
++#include <sys/malloc.h>
++
++#include <netinet/in.h>
++#include <netinet/ip_var.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/udp.h>
++#include <netinet/tcpip.h>
++#include <netinet/udp_var.h>
++#ifdef INET6
++#include <netinet/ip6.h>
++#include <netinet6/ip6_var.h>
++#endif /* INET6 */
++
++#include <net/if.h>
++#include <net/if_var.h>
++#include <net/vnet.h>
++#include <net/ethernet.h>
++#include <net/if_vlan_var.h>
++
++#include <machine/in_cksum.h>
++
++/* Define the new net.gso sysctl tree. */
++SYSCTL_NODE(_net, OID_AUTO, gso, CTLFLAG_RW, NULL,
++	"GSO settings and statistics");
++/*
++ * Define net.gso.dev sysctl tree.
++ * It contains the GSO parameters for each interface.
++ */
++SYSCTL_NODE(_net_gso, OID_AUTO, dev, CTLFLAG_RW, NULL,
++	"GSO device settings");
++
++#ifdef GSO_STATS
++struct gsostat _gsostat;
++SYSCTL_STRUCT(_net_gso, OID_AUTO, stats, CTLFLAG_RW,
++	&_gsostat, gsostat,
++	"GSO statistics (struct gsostat, net/gso.h)");
++#endif /* GSO_STATS */
++
++MALLOC_DEFINE(M_GSO, "GSO", "GSO internals");
++
++/*
++ * Default GSO parameters for each interface.
++ */
++#define GSO_INIT_MAXPACKET 	IP_MAXPACKET
++#define GSO_INIT_ENABLE		1
++
++/*
++ * Array of function pointers that execute the GSO depending on packet type
++ */
++int (*gso_functions[GSO_END_OF_TYPE]) (struct ifnet*, struct mbuf*, u_int);
++
++/*
++ * DEBUG utilities
++ */
++//#define GSO_DEBUG
++//#define GSO_TEST
++
++/* Printf utility from netmap */
++#define ND(format, ...)
++#define D(format, ...)                                          \
++        do {                                                    \
++                struct timeval __xxts;                          \
++                microtime(&__xxts);                             \
++                printf("%03d.%06d %s [%d] " format "\n",        \
++                (int)__xxts.tv_sec % 1000, (int)__xxts.tv_usec, \
++                __FUNCTION__, __LINE__, ##__VA_ARGS__);         \
++        } while (0)
++
++/* rate limited, lps indicates how many per second */
++#define RD(lps, format, ...)                                    \
++        do {                                                    \
++                static int t0, __cnt;                           \
++                if (t0 != time_second) {                        \
++                        t0 = time_second;                       \
++                        __cnt = 0;                              \
++                }                                               \
++                if (__cnt++ < lps)                              \
++                        D(format, ##__VA_ARGS__);               \
++        } while (0)
++
++
++
++/*
++ * XXX-ste: Maybe this function must be moved into kern/uipc_mbuf.c
++ *
++ * Create a queue of packets/segments which fit the given mss + hdr_len.
++ * m0 points to mbuf chain to be segmented.
++ * This function splits the payload (m0-> m_pkthdr.len - hdr_len)
++ * into segments of length MSS bytes and then copy the first hdr_len bytes
++ * from m0 at the top of each segment.
++ * If hdr2_buf is not NULL (hdr2_len is the buf length), it is copied
++ * in each segment after the first hdr_len bytes
++ *
++ * Return the new queue with the segments on success, NULL on failure.
++ * (the mbuf queue is freed in this case).
++ * nsegs contains the number of segments generated.
++ */
++static struct mbuf *
++m_seg(struct mbuf *m0, int hdr_len, int mss, int *nsegs, char * hdr2_buf, int hdr2_len)
++{
++	int off = 0, n, firstlen;
++	struct mbuf **mnext, *mseg;
++	int total_len = m0->m_pkthdr.len;
++
++	/*
++	 * Segmentation useless
++	 */
++	if (total_len <= hdr_len + mss) {
++		return m0;
++	}
++
++	if (!hdr2_buf || hdr2_len <= 0) {
++		hdr2_buf = NULL;
++		hdr2_len = 0;
++	}
++
++	off = hdr_len + mss;
++	firstlen = mss; /* first segment stored in the original mbuf */
++
++	mnext = &(m0->m_nextpkt); /* pointer to next packet */
++
++	for (n = 1; off < total_len; off += mss, n++) {
++		struct mbuf *m;
++		/*
++		 * Copy the header from the original packet
++		 * and create a new mbuf chain
++		 */
++		if (MHLEN < hdr_len)
++			m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
++		else
++			m = m_gethdr(M_NOWAIT, MT_DATA);
++
++		if (m == NULL) {
++#ifdef GSO_DEBUG
++			D("MGETHDR error\n");
++#endif
++			goto err;
++		}
++
++		m_copydata(m0, 0, hdr_len, mtod(m, caddr_t));
++
++		m->m_len = hdr_len;
++		/*
++		 * if the optional header is present, copy it
++		 */
++		if (hdr2_buf) {
++			m_copyback(m, hdr_len, hdr2_len, hdr2_buf);
++		}
++
++		m->m_flags |= (m0->m_flags & M_COPYFLAGS);
++		if (off + mss >= total_len) {		/* last segment */
++			mss = total_len - off;
++		}
++		/*
++		 * Copy the payload from original packet
++		 */
++		mseg = m_copym(m0, off, mss, M_NOWAIT);
++		if (mseg == NULL) {
++			m_freem(m);
++#ifdef GSO_DEBUG
++			D("m_copym error\n");
++#endif
++			goto err;
++		}
++		m_cat(m, mseg);
++
++		m->m_pkthdr.len = hdr_len + hdr2_len + mss;
++		m->m_pkthdr.rcvif = m0->m_pkthdr.rcvif;
++		/*
++		 * Copy the checksum flags and data (in_cksum() need this)
++		 */
++		m->m_pkthdr.csum_flags = m0->m_pkthdr.csum_flags;
++		m->m_pkthdr.csum_data = m0->m_pkthdr.csum_data;
++		m->m_pkthdr.tso_segsz = m0->m_pkthdr.tso_segsz;
++
++		*mnext = m;
++		mnext = &(m->m_nextpkt);
++	}
++
++	/*
++	 * Update first segment.
++	 * If the optional header is present, is necessary
++	 * to insert it into the first segment.
++	 */
++	if (!hdr2_buf) {
++		m_adj(m0, hdr_len + firstlen - total_len);
++		m0->m_pkthdr.len = hdr_len + firstlen;
++	} else {
++		mseg = m_copym(m0, hdr_len, firstlen, M_NOWAIT);
++		if (mseg == NULL) {
++#ifdef GSO_DEBUG
++			D("m_copym error\n");
++#endif
++			goto err;
++		}
++		m_adj(m0, hdr_len - total_len);
++		m_copyback(m0, hdr_len, hdr2_len, hdr2_buf);
++		m_cat(m0, mseg);
++		m0->m_pkthdr.len = hdr_len + hdr2_len + firstlen;
++	}
++
++	if (nsegs != NULL) {
++		*nsegs = n;
++	}
++	return m0;
++err:
++	while (m0 != NULL) {
++		mseg = m0->m_nextpkt;
++		m0->m_nextpkt = NULL;
++		m_freem(m0);
++		m0 = mseg;
++	}
++	return NULL;
++}
++
++
++/*
++ * Wrappers of IPv4 checksum functions
++ */
++static inline void
++gso_ipv4_data_cksum(struct mbuf *m, struct ip *ip, int mac_hlen)
++{
++	m->m_data += mac_hlen;
++	m->m_len -= mac_hlen;
++	m->m_pkthdr.len -= mac_hlen;
++#if __FreeBSD_version < 1000000
++	ip->ip_len = ntohs(ip->ip_len);	/* needed for in_delayed_cksum() */
++#endif
++
++	in_delayed_cksum(m);
++
++#if __FreeBSD_version < 1000000
++	ip->ip_len = htons(ip->ip_len);
++#endif
++	m->m_pkthdr.csum_flags &= ~CSUM_DELAY_DATA;
++	m->m_len += mac_hlen;
++	m->m_pkthdr.len += mac_hlen;
++	m->m_data -= mac_hlen;
++}
++
++static inline void
++gso_ipv4_hdr_cksum(struct mbuf *m, struct ip *ip, int mac_hlen, int ip_hlen)
++{
++	m->m_data += mac_hlen;
++
++	ip->ip_sum = in_cksum(m, ip_hlen);
++
++	m->m_pkthdr.csum_flags &= ~CSUM_IP;
++	m->m_data -= mac_hlen;
++}
++
++/*
++ * Structure that contains the state during the TCP segmentation
++ */
++struct gso_ip_tcp_state {
++	void	(*update)
++		(struct gso_ip_tcp_state*, struct mbuf*);
++	void	(*internal)
++		(struct gso_ip_tcp_state*, struct mbuf*);
++	union {
++		struct ip *ip;
++#ifdef INET6
++		struct ip6_hdr *ip6;
++#endif /* INET6 */
++	} hdr;
++	struct tcphdr *tcp;
++	int mac_hlen;
++	int ip_hlen;
++	int tcp_hlen;
++	int hlen;
++	int pay_len;
++	int sw_csum;
++	uint32_t tcp_seq;
++	uint16_t ip_id;
++};
++
++/*
++ * Update the pointers to TCP and IPv4 headers
++ */
++static inline void
++gso_ipv4_tcp_update(struct gso_ip_tcp_state *state, struct mbuf *m)
++{
++	state->hdr.ip = (struct ip *)(mtod(m, uint8_t *) + state->mac_hlen);
++	state->tcp = (struct tcphdr *)((caddr_t)(state->hdr.ip) + state->ip_hlen);
++	state->pay_len = m->m_pkthdr.len - state->hlen;
++}
++
++/*
++ * Set properly the TCP and IPv4 headers
++ */
++static inline void
++gso_ipv4_tcp_internal(struct gso_ip_tcp_state *state, struct mbuf *m)
++{
++	/*
++	 * Update IP header
++	 */
++	state->hdr.ip->ip_id = htons((state->ip_id)++);
++	state->hdr.ip->ip_len = htons(m->m_pkthdr.len - state->mac_hlen);
++	/*
++	 * TCP Checksum
++	 */
++	state->tcp->th_sum = 0;
++	state->tcp->th_sum = in_pseudo(state->hdr.ip->ip_src.s_addr,
++			state->hdr.ip->ip_dst.s_addr,
++			htons(state->tcp_hlen + IPPROTO_TCP + state->pay_len));
++	/*
++	 * Checksum HW not supported (TCP)
++	 */
++	if (state->sw_csum & CSUM_DELAY_DATA) {
++		gso_ipv4_data_cksum(m, state->hdr.ip, state->mac_hlen);
++	}
++
++	state->tcp_seq += state->pay_len;
++	/*
++	 * IP Checksum
++	 */
++	state->hdr.ip->ip_sum = 0;
++	/*
++	 * Checksum HW not supported (IP)
++	 */
++	if (state->sw_csum & CSUM_IP) {
++		gso_ipv4_hdr_cksum(m, state->hdr.ip, state->mac_hlen, state->ip_hlen);
++	}
++}
++
++
++/*
++ * Updates the pointers to TCP and IPv6 headers
++ */
++#ifdef INET6
++static inline void
++gso_ipv6_tcp_update(struct gso_ip_tcp_state *state, struct mbuf *m)
++{
++	state->hdr.ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + state->mac_hlen);
++	state->tcp = (struct tcphdr *)((caddr_t)(state->hdr.ip6) + state->ip_hlen);
++	state->pay_len = m->m_pkthdr.len - state->hlen;
++}
++
++/*
++ * Sets properly the TCP and IPv6 headers
++ */
++static inline void
++gso_ipv6_tcp_internal(struct gso_ip_tcp_state *state, struct mbuf *m)
++{
++	state->hdr.ip6->ip6_plen = htons(m->m_pkthdr.len -
++					state->mac_hlen - state->ip_hlen);
++	/*
++	 * TCP Checksum
++	 */
++	state->tcp->th_sum = 0;
++	state->tcp->th_sum = in6_cksum_pseudo(state->hdr.ip6,
++				state->tcp_hlen + state->pay_len, IPPROTO_TCP, 0);
++	/*
++	 * Checksum HW not supported (TCP)
++	 */
++	if (state->sw_csum & CSUM_DELAY_DATA_IPV6) {
++		in6_delayed_cksum(m, m->m_pkthdr.len - state->ip_hlen - state->mac_hlen,
++				state->ip_hlen + state->mac_hlen);
++
++		m->m_pkthdr.csum_flags &= ~CSUM_DELAY_DATA_IPV6;
++	}
++	state->tcp_seq += state->pay_len;
++}
++#endif /* INET6 */
++
++/*
++ * Init the state during the TCP segmentation
++ */
++static inline void
++gso_ip_tcp_init_state(struct gso_ip_tcp_state *state, struct ifnet *ifp, struct mbuf *m, int mac_hlen, int ip_hlen, int isipv6)
++{
++#ifdef INET6
++	if (isipv6) {
++		state->hdr.ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + mac_hlen);
++		state->tcp = (struct tcphdr *)((caddr_t)(state->hdr.ip6) + ip_hlen);
++		state->update = gso_ipv6_tcp_update;
++		state->internal = gso_ipv6_tcp_internal;
++	} else
++#endif /* INET6 */
++	{
++		state->hdr.ip = (struct ip *)(mtod(m, uint8_t *) + mac_hlen);
++		state->ip_id = ntohs(state->hdr.ip->ip_id);
++		state->tcp = (struct tcphdr *)((caddr_t)(state->hdr.ip) + ip_hlen);
++		state->update = gso_ipv4_tcp_update;
++		state->internal = gso_ipv4_tcp_internal;
++	}
++
++	state->mac_hlen = mac_hlen;
++	state->ip_hlen = ip_hlen;
++	state->tcp_hlen = state->tcp->th_off << 2;
++	state->hlen = mac_hlen + ip_hlen + state->tcp_hlen;
++	state->tcp_seq = ntohl(state->tcp->th_seq);
++	state->sw_csum = m->m_pkthdr.csum_flags & ~ifp->if_hwassist;
++}
++
++/*
++ * GSO on TCP/IP (v4 or v6)
++ */
++static int
++gso_ip_tcp(struct ifnet *ifp, struct mbuf *m0, struct gso_ip_tcp_state *state)
++{
++	struct mbuf *m, *m_tx;
++	int error = 0;
++	int mss = 0;
++	int nsegs = 0;
++#ifdef GSO_STATS
++	int total_len = m0->m_pkthdr.len;
++#endif /* GSO_STATS */
++
++	if (m0->m_pkthdr.csum_flags & ifp->if_hwassist & CSUM_TSO) {/* TSO with GSO */
++		mss = ifp->if_hw_tsomax - state->ip_hlen - state->tcp_hlen;
++	} else {
++		mss = m0->m_pkthdr.tso_segsz;
++	}
++
++	m0 = m_seg(m0, state->hlen, mss, &nsegs, 0, 0);
++	if (m0 == NULL) {
++		m = m0;
++		error = ENOBUFS;		/* XXX ok? */
++		goto err;
++	}
++	/*
++	 * XXX-ste: can this happen?
++	 */
++	if (m0->m_nextpkt == NULL) {
++#ifdef GSO_DEBUG
++		D("only 1 segment");
++#endif
++		error = ((ifp->if_transmit)(ifp, m0));
++		return error;
++	}
++#ifdef GSO_STATS
++	GSOSTAT_SET_MAX(tcp.gsos_max_mss,mss);
++	GSOSTAT_SET_MIN(tcp.gsos_min_mss,mss);
++	GSOSTAT_ADD(tcp.gsos_osegments,nsegs);
++#endif /* GSO_STATS */
++
++	/* firts pkt */
++	m = m0;
++
++	state->update(state, m);
++
++	do {
++		state->tcp->th_flags &= ~ (TH_FIN | TH_PUSH);
++
++		state->internal(state, m);
++
++		m_tx = m;
++		m = m->m_nextpkt;
++		m_tx->m_nextpkt = NULL;
++
++		if (error = ((ifp->if_transmit)(ifp, m_tx))) {
++			/*
++			 * XXX: If a segment can not be sent, discard the following
++			 * segments and propagate the erorr to the upper levels.
++			 * In this way the TCP retrasmits all the initial packet.
++			 */
++#ifdef GSO_DEBUG
++			D("if_transmit error\n");
++#endif
++			goto err;
++		}
++
++		state->update(state, m);
++
++		state->tcp->th_flags &= ~ TH_CWR;
++		state->tcp->th_seq = htonl(state->tcp_seq);
++	} while (m->m_nextpkt);
++
++	/* last pkt */
++	state->internal(state, m);
++
++	error = ((ifp->if_transmit)(ifp, m));
++
++#ifdef GSO_DEBUG
++	if (error) {
++		D("last if_transmit error\n");
++		D("error - type = %d \n", error);
++	}
++#endif
++#ifdef GSO_STATS
++	if (!error) {
++		GSOSTAT_INC(tcp.gsos_segmented);
++		GSOSTAT_SET_MAX(tcp.gsos_maxsegmented, total_len);
++		GSOSTAT_SET_MIN(tcp.gsos_minsegmented, total_len);
++		GSOSTAT_ADD(tcp.gsos_totalbyteseg, total_len);
++	}
++#endif /* GSO_STATS */
++	return error;
++
++err:
++#ifdef GSO_DEBUG
++	D("error - type = %d \n", error);
++#endif
++	while (m != NULL) {
++		m_tx = m->m_nextpkt;
++		m->m_nextpkt = NULL;
++		m_freem(m);
++		m = m_tx;
++	}
++	return error;
++}
++
++/*
++ * GSO on TCP/IPv4
++ */
++static int
++gso_ipv4_tcp(struct ifnet *ifp, struct mbuf *m0, u_int mac_hlen)
++{
++	struct ip *ip;
++	struct gso_ip_tcp_state state;
++	int hlen;
++	int ip_hlen;
++
++	hlen = mac_hlen + sizeof(struct ip);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			return ENOBUFS;
++		}
++	}
++	ip = (struct ip *)(mtod(m0, uint8_t *) + mac_hlen);
++	ip_hlen = ip->ip_hl << 2;
++
++	hlen = mac_hlen + ip_hlen + sizeof(struct tcphdr);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			return ENOBUFS;
++		}
++	}
++
++	gso_ip_tcp_init_state(&state, ifp, m0, mac_hlen, ip_hlen, 0);
++
++	return gso_ip_tcp(ifp, m0, &state);
++}
++
++/*
++ * GSO on TCP/IPv6
++ */
++#ifdef INET6
++static int
++gso_ipv6_tcp(struct ifnet *ifp, struct mbuf *m0, u_int mac_hlen)
++{
++	struct ip6_hdr *ip6;
++	struct gso_ip_tcp_state state;
++	int hlen;
++	int ip_hlen;
++
++	hlen = mac_hlen + sizeof(struct ip6_hdr);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			return ENOBUFS;
++		}
++	}
++	ip6 = (struct ip6_hdr *)(mtod(m0, uint8_t *) + mac_hlen);
++	ip_hlen = ip6_lasthdr(m0, mac_hlen, IPPROTO_IPV6, NULL) - mac_hlen;
++
++	hlen = mac_hlen + ip_hlen + sizeof(struct tcphdr);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			return ENOBUFS;
++		}
++	}
++
++	gso_ip_tcp_init_state(&state, ifp, m0, mac_hlen, ip_hlen, 1);
++
++	return gso_ip_tcp(ifp, m0, &state);
++}
++#endif /* INET6 */
++
++/*
++ * IPv4 fragmentation (for UDP)
++ */
++static int
++gso_ipv4_frag(struct ifnet *ifp, struct mbuf *m0, u_int mac_hlen)
++{
++	int error = 0;
++	struct mbuf *m, *m_tx;
++	struct ip *ip;
++	int hlen;
++	int ip_hlen;
++	int mss;
++	int sw_csum;
++	int off;
++	int nfrags = 0;
++#ifdef GSO_STATS
++	int total_len = m0->m_pkthdr.len;
++#endif /* GSO_STATS */
++
++	hlen = mac_hlen + sizeof(struct ip);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			m = m0;
++			error = ENOBUFS;
++			goto err;
++		}
++	}
++
++	ip = (struct ip *)(mtod(m0, uint8_t *) + mac_hlen);
++	ip_hlen = ip->ip_hl << 2;
++
++	hlen = mac_hlen + ip_hlen;
++
++	/* XXX: redo pullup?? */
++
++	/*
++	 * Payload checksum calculation
++	 */
++	if (m0->m_pkthdr.csum_flags & CSUM_DELAY_DATA) {
++		gso_ipv4_data_cksum(m0, ip, mac_hlen);
++	}
++
++	mss = m0->m_pkthdr.tso_segsz & ~7;
++
++	/*
++	 * Software checksum flags
++	 */
++	sw_csum = m0->m_pkthdr.csum_flags & ~ifp->if_hwassist;
++
++	m0 = m_seg(m0, hlen, mss, &nfrags, 0, 0);
++	if (m0 == NULL) {
++		m = m0;
++		error = ENOBUFS;                /* XXX ok? */
++		goto err;
++	}
++
++#ifdef GSO_STATS
++	GSOSTAT_SET_MAX(ipv4_frag.gsos_max_mss,mss);
++	GSOSTAT_SET_MIN(ipv4_frag.gsos_min_mss,mss);
++	GSOSTAT_ADD(ipv4_frag.gsos_osegments,nfrags);
++#endif /* GSO_STATS */
++
++	/* first frag */
++	m = m0;
++
++	ip = (struct ip *)(mtod(m, uint8_t *) + mac_hlen);
++	off = 0;
++
++	do {
++		ip->ip_off = htons((off >> 3) | IP_MF);
++		ip->ip_len = htons(m->m_pkthdr.len - mac_hlen);
++		ip->ip_sum = 0;
++		if (sw_csum & CSUM_IP) {
++			gso_ipv4_hdr_cksum(m, ip, mac_hlen, ip_hlen);
++		}
++		off += m->m_pkthdr.len - hlen;
++
++		m_tx = m;
++		m = m->m_nextpkt;
++		m_tx->m_nextpkt = NULL;
++
++		if (error = ((ifp->if_transmit)(ifp, m_tx))) {
++#ifdef GSO_DEBUG
++			D("if_transmit error\n");
++			D("m->m_pkthdr.len: %d", m_tx->m_pkthdr.len);
++#endif
++			goto err;
++		}
++
++		ip = (struct ip *)(mtod(m, uint8_t *) + mac_hlen);
++
++	} while (m->m_nextpkt);
++
++	/* last pkt */
++	ip->ip_off = htons((off >> 3));
++	ip->ip_len = htons(m->m_pkthdr.len - mac_hlen);
++	ip->ip_sum = 0;
++	if (sw_csum & CSUM_IP) {
++		gso_ipv4_hdr_cksum(m, ip, mac_hlen, ip_hlen);
++	}
++
++	error = ((ifp->if_transmit)(ifp, m));
++
++#ifdef GSO_DEBUG
++	if (error) {
++		D("last if_transmit error\n");
++		D("error - type = %d \n", error);
++		D("m->m_pkthdr.len: %d", m->m_pkthdr.len);
++	}
++#endif
++#ifdef GSO_STATS
++	if (!error) {
++		GSOSTAT_INC(ipv4_frag.gsos_segmented);
++		GSOSTAT_SET_MAX(ipv4_frag.gsos_maxsegmented, total_len);
++		GSOSTAT_SET_MIN(ipv4_frag.gsos_minsegmented, total_len);
++		GSOSTAT_ADD(ipv4_frag.gsos_totalbyteseg, total_len);
++	}
++#endif /* GSO_STATS */
++	return error;
++
++err:
++#ifdef GSO_DEBUG
++	D("error - type = %d \n", error);
++#endif
++	while (m != NULL) {
++		m_tx = m->m_nextpkt;
++		m->m_nextpkt = NULL;
++		m_freem(m);
++		m = m_tx;
++	}
++	return error;
++}
++
++
++/*
++ * IPv6 fragmentation (for UDP)
++ */
++#ifdef INET6
++static int
++gso_ipv6_frag(struct ifnet *ifp, struct mbuf *m0, u_int mac_hlen)
++{
++	int error = 0;
++	struct mbuf *m, *m_tx, *m_ip6f;
++	struct ip6_hdr *ip6;
++	struct ip6_frag ip6f, *ip6f_p;
++	uint32_t id;
++	int hlen, mss;
++	int sw_csum;
++	int off, off_ip6f;
++	int ip_hlen, nextproto;
++	int nfrags = 0;
++#ifdef GSO_STATS
++	int total_len = m0->m_pkthdr.len;
++#endif /* GSO_STATS */
++
++	hlen = mac_hlen + sizeof(struct ip6_hdr);
++
++	if (m0->m_len < hlen) {
++#ifdef GSO_DEBUG
++		D("m_len < hlen - m_len: %d hlen: %d", m0->m_len, hlen);
++#endif
++		m0 = m_pullup(m0, hlen);
++		if (m0 == NULL) {
++			m = m0;
++			error = ENOBUFS;
++			goto err;
++		}
++	}
++	ip6 = (struct ip6_hdr *)(mtod(m0, uint8_t *) + mac_hlen);
++	hlen = ip6_lasthdr(m0, mac_hlen, IPPROTO_IPV6, &nextproto);
++	ip_hlen = hlen - mac_hlen;
++
++	/* XXX: redo pullup?? */
++
++	/*
++	 * Payload checksum calculation
++	 */
++	if (m0->m_pkthdr.csum_flags & CSUM_DELAY_DATA_IPV6) {
++		in6_delayed_cksum(m0, m0->m_pkthdr.len - hlen, hlen);
++
++		m0->m_pkthdr.csum_flags &= ~CSUM_DELAY_DATA_IPV6;
++	}
++
++	/*
++	 * XXX-ste: ip6_get_prevhdr is deprecated
++	 * find an alternative:
++	 * 	-set in ip6_output()?
++	 */
++	{
++		char *lastnxtp;
++		m0->m_data += mac_hlen;
++
++		lastnxtp = ip6_get_prevhdr(m0, ip_hlen);
++		*lastnxtp = IPPROTO_FRAGMENT;
++
++		m0->m_data -= mac_hlen;
++	}
++
++	mss = m0->m_pkthdr.tso_segsz & ~7;
++	/*
++	 * Software checksum flags
++	 */
++	sw_csum = m0->m_pkthdr.csum_flags & ~ifp->if_hwassist;
++
++	id = htonl(ip6_randomid());
++	ip6f.ip6f_ident = id;
++	ip6f.ip6f_nxt = nextproto;
++	ip6f.ip6f_reserved = 0;
++
++	m0 = m_seg(m0, hlen, mss, &nfrags,(char *) &ip6f, sizeof(struct ip6_frag));
++	if (m0 == NULL) {
++		m = m0;
++		error = ENOBUFS;	/* XXX ok? */
++		goto err;
++	}
++#ifdef GSO_STATS
++	GSOSTAT_SET_MAX(ipv6_frag.gsos_max_mss,mss);
++	GSOSTAT_SET_MIN(ipv6_frag.gsos_min_mss,mss);
++	GSOSTAT_ADD(ipv6_frag.gsos_osegments,nfrags);
++#endif /* GSO_STATS */
++	/* first frag */
++	m = m0;
++	off = 0;
++	ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + mac_hlen);
++	m_ip6f = m_getptr(m, hlen, &off_ip6f);
++	ip6f_p = (struct ip6_frag *)(mtod(m_ip6f, uint8_t *) + off_ip6f);
++	do {
++		ip6f_p->ip6f_offlg = htons((u_short)((off) & ~7)) | IP6F_MORE_FRAG;
++		ip6->ip6_plen = htons(m->m_pkthdr.len - mac_hlen - sizeof(struct ip6_hdr));
++		off += m->m_pkthdr.len - hlen - sizeof(struct ip6_frag);
++
++		m_tx = m;
++		m = m->m_nextpkt;
++		m_tx->m_nextpkt = NULL;
++
++		if (error = ((ifp->if_transmit)(ifp, m_tx))) {
++#ifdef GSO_DEBUG
++			D("if_transmit error\n");
++#endif
++			goto err;
++		}
++		ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + mac_hlen);
++		m_ip6f = m_getptr(m, hlen, &off_ip6f);
++		ip6f_p = (struct ip6_frag *)(mtod(m_ip6f, uint8_t *) + off_ip6f);
++	} while (m->m_nextpkt);
++
++	/* last pkt */
++	ip6f_p->ip6f_offlg = htons((u_short)((off) & ~7));
++	ip6->ip6_plen = htons(m->m_pkthdr.len - mac_hlen - sizeof(struct ip6_hdr));
++	error = ((ifp->if_transmit)(ifp, m));
++
++#ifdef GSO_DEBUG
++	if (error) {
++		D("last if_transmit error\n");
++		D("error - type = %d \n", error);
++	}
++#endif
++#ifdef GSO_STATS
++	if (!error) {
++		GSOSTAT_INC(ipv6_frag.gsos_segmented);
++		GSOSTAT_SET_MAX(ipv6_frag.gsos_maxsegmented, total_len);
++		GSOSTAT_SET_MIN(ipv6_frag.gsos_minsegmented, total_len);
++		GSOSTAT_ADD(ipv6_frag.gsos_totalbyteseg, total_len);
++	}
++#endif /* GSO_STATS */
++	return error;
++err:
++#ifdef GSO_DEBUG
++	D("error - type = %d \n", error);
++#endif
++	while (m != NULL) {
++		m_tx = m->m_nextpkt;
++		m->m_nextpkt = NULL;
++		m_freem(m);
++		m = m_tx;
++	}
++	return error;
++}
++#endif /* INET6 */
++
++int
++gso_none(struct ifnet *ifp, struct mbuf *m, u_int mac_hlen)
++{
++	/*
++	 * GSO is disable, we send the packet directly to the device driver
++	 */
++	return ((ifp->if_transmit)(ifp, m));
++}
++
++int
++gso_dispatch(struct ifnet *ifp, struct mbuf *m, u_int mac_hlen)
++{
++	int error = 0;
++	u_int gso_flags;	/* XXX: is type correct? */
++
++	gso_flags = CSUM_TO_GSO(m->m_pkthdr.csum_flags);
++
++	if (gso_flags >= GSO_END_OF_TYPE) {
++#ifdef GSO_DEBUG
++		D("gso_flags out of range or null [%d]", gso_flags);
++#endif
++		m_freem(m);
++		return ENOPROTOOPT;
++	}
++
++	error = gso_functions[gso_flags](ifp, m, mac_hlen);
++
++#ifdef GSO_DEBUG
++	if (error)
++		D("error segmentation - type = %d\n", error);
++#endif
++	return error;
++}
++
++static inline void
++gso_init()
++{
++	gso_functions[GSO_NONE] = gso_none;
++	gso_functions[GSO_TCP4] = gso_ipv4_tcp;
++	gso_functions[GSO_UDP4] = gso_ipv4_frag;
++#ifdef INET6
++	gso_functions[GSO_TCP6] = gso_ipv6_tcp;
++	gso_functions[GSO_UDP6] = gso_ipv6_frag;
++#endif /* INET6 */
++#ifdef GSO_STATS
++	gsostat_reset(&_gsostat);
++#endif /* GSO_STATS */
++}
++
++void
++gso_ifattach(struct ifnet *ifp)
++{
++	struct if_gso *if_gso;
++	struct sysctl_ctx_list *clist;
++	struct sysctl_oid *oid_root, *oid_p;
++
++	/*
++	 * Check if gso_functions[] array is initialized
++	 */
++	if (gso_functions[GSO_NONE] != gso_none) {
++		gso_init();
++	}
++
++	/*
++	 * Initialization of GSO parameters
++	 */
++	if_gso = malloc(sizeof(struct if_gso), M_GSO, M_WAITOK | M_ZERO);
++	if_gso->max_burst = GSO_INIT_MAXPACKET;
++	if_gso->enable = GSO_INIT_ENABLE;
++
++	/*
++	 * Creation of sysctl to set GSO parameters for this interface (ifp)
++	 */
++	clist = &(if_gso->clist);
++	sysctl_ctx_init(clist);
++	oid_root = SYSCTL_ADD_NODE(clist, SYSCTL_STATIC_CHILDREN(_net_gso_dev),
++			OID_AUTO, ifp->if_xname, CTLFLAG_RW, 0, "if name");
++	oid_p = SYSCTL_ADD_UINT(clist, SYSCTL_CHILDREN(oid_root),
++			OID_AUTO, "max_burst", CTLFLAG_RW, &(if_gso->max_burst),
++			0, "GSO burst length limit");
++	oid_p = SYSCTL_ADD_UINT(clist, SYSCTL_CHILDREN(oid_root),
++			OID_AUTO, "enable_gso", CTLFLAG_RW, &(if_gso->enable),
++			0, "GSO enable (!=0)");
++	/*
++	 * Put if_gso inside struct ifnet
++	 */
++	W_IF_GSO(ifp) = if_gso;
++}
++
++void
++gso_ifdetach(struct ifnet *ifp)
++{
++	struct if_gso *if_gso;
++
++	if_gso = IF_GSO(ifp);
++	if (if_gso == NULL)
++		return;
++
++	W_IF_GSO(ifp) = NULL;
++
++	if (sysctl_ctx_free(&(if_gso->clist))) {
++#ifdef GSO_DEBUG
++		D("error sysctl_ctx_free");
++#endif
++	}
++
++	free(if_gso, M_GSO);
++}
+diff --git a/sys/net/gso.h b/sys/net/gso.h
+new file mode 100644
+index 0000000..ecbb31a
+--- /dev/null
++++ b/sys/net/gso.h
+@@ -0,0 +1,174 @@
++/*
++ * Copyright (C) 2014, Stefano Garzarella - Universita` di Pisa.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *   1. Redistributions of source code must retain the above copyright
++ *      notice, this list of conditions and the following disclaimer.
++ *   2. Redistributions in binary form must reproduce the above copyright
++ *      notice, this list of conditions and the following disclaimer in the
++ *      documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifndef _NET_GSO_H_
++#define _NET_GSO_H_
++
++#ifdef _KERNEL
++#include <sys/types.h>
++#include <sys/stdint.h> /* UINT64_MAX */
++#include <sys/systm.h>	/* memset */
++#include <sys/mbuf.h>
++#include <sys/sysctl.h>
++#else	/* !_KERNEL */
++#include <stdint.h>		/* UINT64_MAX */
++#include <string.h>		/* memset */
++#endif	/* _KERNEL */
++
++#define GSO_SYSCTL_STATS "net.gso.stats"
++
++/*
++ * Structs used to collect statistics
++ */
++struct gsostat_proto {
++	uint64_t gsos_segmented;		/* total burst segmented */
++	uint64_t gsos_osegments; 		/* output segments created */
++	uint64_t gsos_maxsegmented;		/* max size of segmented packets */
++	uint64_t gsos_minsegmented;		/* min size of segmented packets */
++	uint64_t gsos_totalbyteseg;		/* total bytes segmented */
++	uint64_t gsos_max_mss;			/* max Maximum Segment Size */
++	uint64_t gsos_min_mss;			/* min Maximum Segment Size */
++};
++
++struct gsostat {
++	struct gsostat_proto tcp;			/* TCP (IPv4/IPv6) statistics */
++	struct gsostat_proto ipv4_frag;		/* IPv4 frag (UDP) statistics */
++	struct gsostat_proto ipv6_frag;		/* IPv6 frag (UDP) statistics */
++};
++
++/*
++ *	Functions used to reset statistics
++ */
++static inline void
++gsostat_proto_reset(struct gsostat_proto* gsp)
++{
++	memset(gsp, 0, sizeof(struct gsostat_proto));
++	gsp->gsos_minsegmented = UINT64_MAX;
++	gsp->gsos_min_mss = UINT64_MAX;
++}
++
++static inline void
++gsostat_reset(struct gsostat* gs)
++{
++	gsostat_proto_reset(&(gs->tcp));
++	gsostat_proto_reset(&(gs->ipv4_frag));
++	gsostat_proto_reset(&(gs->ipv6_frag));
++}
++
++#ifdef _KERNEL
++
++/*
++ * Enable gso statistics
++ *
++ * The statistics are accessible through sysctl net.gso.stats
++ * (struct gsostat).
++ */
++#define GSO_STATS
++
++/* In-kernel macros to update stats */
++#define GSOSTAT_SET(name, val)		_gsostat.name = val;
++#define GSOSTAT_ADD(name, val)  	_gsostat.name += (val);
++#define GSOSTAT_INC(name)       	GSOSTAT_ADD(name, 1)
++#define GSOSTAT_DEC(name)			GSOSTAT_ADD(name, -1);
++#define GSOSTAT_SET_MAX(name, val)	_gsostat.name = MAX(_gsostat.name,val);
++#define GSOSTAT_SET_MIN(name, val)	_gsostat.name = MIN(_gsostat.name,val);
++
++
++/*
++ * This struct contains all fields needed to support GSO on each NIC.
++ * It is stored in struct ifnet.
++ *
++ * The GSO parameters can be modified through these sysctl:
++ *	sysctl net.gso.dev."ifname".max_burst
++ *	sysctl net.gso.dev."ifname".enable_gso
++ */
++struct if_gso {  			/* XXX exposed or not? */
++	struct sysctl_ctx_list clist;	/* sysctl ctx for this interface */
++
++	/* GSO parameters for each interface */
++	u_int max_burst;		/* GSO burst length limit */
++	u_int enable;			/* GSO enable (!=0)*/
++};
++
++/*
++ * IF_GSO returns a pointer to the struct if_gso from the ifp (struct ifnet *)
++ * W_IF_GSO is used to write it
++ * XXX Temporarily it is contained in a spare field.
++ */
++#if __FreeBSD_version < 1100000
++#define W_IF_GSO(_ifp)    	((_ifp)->if_pspare[2])
++#else
++#define W_IF_GSO(_ifp)    	((_ifp)->if_gso)
++#endif
++
++#define IF_GSO(_ifp)    	((struct if_gso *)W_IF_GSO(_ifp))
++
++/*
++ * T_GSOMAX can be used to read/write the value of gsomax in tcpcb (TCP control block).
++ * XXX Temporarily it is contained in a spare field.
++ */
++#define T_GSOMAX(_tp)		((_tp)->t_ispare[5])
++
++/*
++ * GSO types
++ */
++#define CSUM_GSO_OFFSET 16
++
++enum gso_type {
++	GSO_NONE,
++	GSO_TCP4,
++	GSO_TCP6,
++	GSO_UDP4,
++	GSO_UDP6,
++/*
++ *	GSO_SCTP4, TODO
++ *	GSO_SCTP6,
++ */
++	GSO_END_OF_TYPE
++};
++
++/*
++ * Convert gso_type to CSUM flags (sys/mbuf.h) or vice versa
++ */
++#define GSO_TO_CSUM(x) ((x << CSUM_GSO_OFFSET) & CSUM_GSO_MASK)
++#define CSUM_TO_GSO(x) ((x & CSUM_GSO_MASK) >> CSUM_GSO_OFFSET)
++
++/*
++ * gso_dispatch() performs segmentation and invokes if_transmit() for each
++ * 	segment generated.
++ *
++ * gso_ifattach() initializes a struct if_gso, allocating a new sysctl context
++ * 	and creating the sysctl nodes to change the parameters for each interface.
++ *
++ * gso_ifdetach() frees the memory allocated by gso_ifattach().
++ */
++int 	gso_dispatch(struct ifnet *ifp, struct mbuf *m, u_int mac_hlen);
++void 	gso_ifattach(struct ifnet *ifp);
++void 	gso_ifdetach(struct ifnet *ifp);
++
++#endif  /* _KERNEL */
++
++#endif  /* !_NET_GSO_H_ */
+diff --git a/sys/net/if_ethersubr.c b/sys/net/if_ethersubr.c
+index 4c2bd4e..ed8ca68 100644
+--- a/sys/net/if_ethersubr.c
++++ b/sys/net/if_ethersubr.c
+@@ -64,6 +64,9 @@
+ #include <net/if_llatbl.h>
+ #include <net/pfil.h>
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netpfil/pf/pf_mtag.h>
+ 
+@@ -367,6 +370,27 @@ ether_output_frame(struct ifnet *ifp, struct mbuf *m)
+ 			return (0);
+ 	}
+ 
++#ifdef GSO
++	/*
++	 * If GSO is required, calls gso_dispatch() to do segmentation.
++	 *
++	 * The GSO subsystem will call if_transmit() to send each segment
++	 * to the device driver.
++	 */
++	if (m->m_pkthdr.csum_flags & CSUM_GSO_MASK) {
++		struct ether_vlan_header *eh;
++		u_int eh_len;
++
++		eh = mtod(m, struct ether_vlan_header *);
++		if (eh->evl_encap_proto == htons(ETHERTYPE_VLAN)) {
++			eh_len = ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN;
++		} else {
++			eh_len = ETHER_HDR_LEN;
++		}
++
++		return gso_dispatch(ifp, m, eh_len);
++	}
++#endif /* GSO */
+ 	/*
+ 	 * Queue message on interface, update output statistics if
+ 	 * successful, and start output if interface not yet active.
+@@ -845,6 +869,10 @@ ether_ifattach(struct ifnet *ifp, const u_int8_t *lla)
+ 	bpfattach(ifp, DLT_EN10MB, ETHER_HDR_LEN);
+ 	if (ng_ether_attach_p != NULL)
+ 		(*ng_ether_attach_p)(ifp);
++#ifdef GSO
++	/* enable GSO in ethernet device */
++	gso_ifattach(ifp);
++#endif /* GSO */
+ 
+ 	/* Announce Ethernet MAC address if non-zero. */
+ 	for (i = 0; i < ifp->if_addrlen; i++)
+@@ -873,6 +901,9 @@ ether_ifdetach(struct ifnet *ifp)
+ 		(*ng_ether_detach_p)(ifp);
+ 	}
+ 
++#ifdef GSO
++	gso_ifdetach(ifp);
++#endif /* GSO */
+ 	bpfdetach(ifp);
+ 	if_detach(ifp);
+ }
+diff --git a/sys/net/if_var.h b/sys/net/if_var.h
+index 3bffefe..8cd0319 100644
+--- a/sys/net/if_var.h
++++ b/sys/net/if_var.h
+@@ -202,6 +202,7 @@ struct ifnet {
+ 	struct	carp_if *if_carp;	/* carp interface structure */
+ 	struct	label *if_label;	/* interface MAC label */
+ 	struct	netmap_adapter *if_netmap; /* netmap(4) softc */
++	void	*if_gso;	/* GSO structure */
+ 
+ 	/* Various procedures of the layer2 encapsulation and drivers. */
+ 	int	(*if_output)		/* output routine (enqueue) */
+diff --git a/sys/netinet/ip_output.c b/sys/netinet/ip_output.c
+index 8503b2f..fd418e2 100644
+--- a/sys/netinet/ip_output.c
++++ b/sys/netinet/ip_output.c
+@@ -66,6 +66,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/radix_mpath.h>
+ #endif
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/in.h>
+ #include <netinet/in_kdtrace.h>
+@@ -140,6 +143,8 @@ ip_output(struct mbuf *m, struct mbuf *opt, struct route *ro, int flags,
+ #ifdef IPSEC
+ 	int no_route_but_check_spd = 0;
+ #endif
++	int gso = 0;
++
+ 	M_ASSERTPKTHDR(m);
+ 
+ 	if (inp != NULL) {
+@@ -608,10 +613,33 @@ passout:
+ 	}
+ 
+ 	m->m_pkthdr.csum_flags |= CSUM_IP;
+-	if (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA & ~ifp->if_hwassist) {
++#ifdef GSO
++	gso = (m->m_pkthdr.csum_flags & CSUM_GSO_MASK) && IF_GSO(ifp)->enable;
++	/*
++	 * If GSO is enabled on UDP packet, check if it is necessary.
++	 * GSO is necessary only if the ip_len exceeds MTU
++	 */
++	if (gso && (CSUM_TO_GSO(m->m_pkthdr.csum_flags) == GSO_UDP4)) {
++		if (ip_len > mtu)
++			m->m_pkthdr.tso_segsz = (mtu - hlen) & ~7;
++		else
++			gso = 0;
++	}
++	/* Reset GSO flags if it is not necessary */
++	if (!gso) {
++		m->m_pkthdr.csum_flags &= ~CSUM_GSO_MASK;
++	}
++	/*
++	 * If GSO is enabled, the TCP checksum must be calculated on each segment.
++	 * XXX-ste:	maybe if TSO is enabled, the checksum calculation is not necessary.
++	 * 		if (!gso && (m->m_pkthdr.csum_flags & (CSUM_DELAY_DATA | CSUM_TSO) & ~ifp->if_hwassist))
++	 */
++#endif /* GSO */
++	if (!gso && (m->m_pkthdr.csum_flags & CSUM_DELAY_DATA & ~ifp->if_hwassist)) {
+ 		in_delayed_cksum(m);
+ 		m->m_pkthdr.csum_flags &= ~CSUM_DELAY_DATA;
+ 	}
++
+ #ifdef SCTP
+ 	if (m->m_pkthdr.csum_flags & CSUM_SCTP & ~ifp->if_hwassist) {
+ 		sctp_delayed_cksum(m, (uint32_t)(ip->ip_hl << 2));
+@@ -623,10 +651,14 @@ passout:
+ 	 * If small enough for interface, or the interface will take
+ 	 * care of the fragmentation for us, we can just send directly.
+ 	 */
+-	if (ip_len <= mtu ||
++	if (ip_len <= mtu || gso ||
+ 	    (m->m_pkthdr.csum_flags & ifp->if_hwassist & CSUM_TSO) != 0) {
+ 		ip->ip_sum = 0;
+-		if (m->m_pkthdr.csum_flags & CSUM_IP & ~ifp->if_hwassist) {
++		/*
++		 * If GSO is enabled, the IP checksum
++		 * must be calculated on each segment
++		 */
++		if (!gso && (m->m_pkthdr.csum_flags & CSUM_IP & ~ifp->if_hwassist)) {
+ 			ip->ip_sum = in_cksum(m, hlen);
+ 			m->m_pkthdr.csum_flags &= ~CSUM_IP;
+ 		}
+@@ -638,7 +670,7 @@ passout:
+ 		 * once instead of for every generated packet.
+ 		 */
+ 		if (!(flags & IP_FORWARDING) && ia) {
+-			if (m->m_pkthdr.csum_flags & CSUM_TSO)
++			if (m->m_pkthdr.csum_flags & (CSUM_TSO | CSUM_GSO_MASK))
+ 				counter_u64_add(ia->ia_ifa.ifa_opackets,
+ 				    m->m_pkthdr.len / m->m_pkthdr.tso_segsz);
+ 			else
+@@ -662,7 +694,8 @@ passout:
+ 	}
+ 
+ 	/* Balk when DF bit is set or the interface didn't support TSO. */
+-	if ((ip_off & IP_DF) || (m->m_pkthdr.csum_flags & CSUM_TSO)) {
++		if ((ip_off & IP_DF) ||
++			(m->m_pkthdr.csum_flags & (CSUM_TSO | CSUM_GSO_MASK))) {
+ 		error = EMSGSIZE;
+ 		IPSTAT_INC(ips_cantfrag);
+ 		goto bad;
+diff --git a/sys/netinet/tcp_input.c b/sys/netinet/tcp_input.c
+index c8404fc..db9dec9 100644
+--- a/sys/netinet/tcp_input.c
++++ b/sys/netinet/tcp_input.c
+@@ -79,6 +79,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/if_var.h>
+ #include <net/route.h>
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #define TCPSTATES		/* for logging */
+ 
+@@ -3616,6 +3619,14 @@ tcp_mss(struct tcpcb *tp, int offer)
+ 		tp->t_flags |= TF_TSO;
+ 		tp->t_tsomax = cap.tsomax;
+ 	}
++
++	/* Check the interface for GSO capabilities. */
++#ifdef GSO
++	if (cap.ifcap & CSUM_GSO_MASK) {
++		tp->t_flags |= TF_GSO;
++		T_GSOMAX(tp) = cap.gsomax;
++	}
++#endif /* GSO */
+ }
+ 
+ /*
+diff --git a/sys/netinet/tcp_output.c b/sys/netinet/tcp_output.c
+index 12d8e75..c66c583 100644
+--- a/sys/netinet/tcp_output.c
++++ b/sys/netinet/tcp_output.c
+@@ -54,6 +54,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/if.h>
+ #include <net/route.h>
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/cc.h>
+ #include <netinet/in.h>
+@@ -100,6 +103,14 @@ SYSCTL_VNET_INT(_net_inet_tcp, OID_AUTO, tso, CTLFLAG_RW,
+ 	&VNET_NAME(tcp_do_tso), 0,
+ 	"Enable TCP Segmentation Offload");
+ 
++#ifdef GSO
++VNET_DEFINE(int, tcp_do_gso) = 1;
++#define	V_tcp_do_gso		VNET(tcp_do_gso)
++SYSCTL_VNET_INT(_net_inet_tcp, OID_AUTO, gso, CTLFLAG_RW,
++	&VNET_NAME(tcp_do_gso), 0,
++	"Enable Generic Segmentation Offload");
++#endif /* GSO */
++
+ VNET_DEFINE(int, tcp_sendspace) = 1024*32;
+ #define	V_tcp_sendspace	VNET(tcp_sendspace)
+ SYSCTL_VNET_INT(_net_inet_tcp, TCPCTL_SENDSPACE, sendspace, CTLFLAG_RW,
+@@ -183,6 +194,9 @@ tcp_output(struct tcpcb *tp)
+ 	int sack_rxmit, sack_bytes_rxmt;
+ 	struct sackhole *p;
+ 	int tso, mtu;
++#ifdef GSO
++	int gso;
++#endif /* GSO */
+ 	struct tcpopt to;
+ #if 0
+ 	int maxburst = TCP_MAXBURST;
+@@ -228,6 +242,9 @@ again:
+ 		tcp_sack_adjust(tp);
+ 	sendalot = 0;
+ 	tso = 0;
++#ifdef GSO
++	gso=0;
++#endif /* GSO */
+ 	mtu = 0;
+ 	off = tp->snd_nxt - tp->snd_una;
+ 	sendwin = min(tp->snd_wnd, tp->snd_cwnd);
+@@ -488,15 +505,21 @@ after_sack_rexmit:
+ 	 */
+ 	ipsec_optlen = ipsec_hdrsiz_tcp(tp);
+ #endif
+-	if ((tp->t_flags & TF_TSO) && V_tcp_do_tso && len > tp->t_maxseg &&
++	if (len > tp->t_maxseg &&
+ 	    ((tp->t_flags & TF_SIGNATURE) == 0) &&
+ 	    tp->rcv_numsacks == 0 && sack_rxmit == 0 &&
+ #ifdef IPSEC
+ 	    ipsec_optlen == 0 &&
+ #endif
+ 	    tp->t_inpcb->inp_options == NULL &&
+-	    tp->t_inpcb->in6p_options == NULL)
+-		tso = 1;
++	    tp->t_inpcb->in6p_options == NULL) {
++		if ((tp->t_flags & TF_TSO) && V_tcp_do_tso)
++			tso = 1;
++#ifdef GSO
++		if ((tp->t_flags & TF_GSO) && V_tcp_do_gso)
++			gso = 1;
++#endif /* GSO */
++	}
+ 
+ 	if (sack_rxmit) {
+ 		if (SEQ_LT(p->rxmit + len, tp->snd_una + so->so_snd.sb_cc))
+@@ -800,13 +823,41 @@ send:
+ 			 */
+ 			if (tp->t_flags & TF_NEEDFIN)
+ 				sendalot = 1;
+-
+-		} else {
++#ifdef GSO
++			/*
++			 * Disable GSO if TSO is required
++			 */
++			gso = 0;
++#endif /* GSO */
++		}
++#ifdef GSO
++		else if (gso) {
++			/*
++			 * Limit a burst to T_GSOMAX minus IP,
++			 * TCP and options length.
++			 */
++			if (len > T_GSOMAX(tp) - hdrlen) {
++				len = MIN(T_GSOMAX(tp), IP_MAXPACKET) - hdrlen;
++				sendalot = 1;
++			}
++			/*
++			 * Send the FIN in a separate segment
++			 * after the bulk sending is done.
++			 */
++			if (tp->t_flags & TF_NEEDFIN)
++				sendalot = 1;
++		}
++#endif /* GSO */
++		else {
+ 			len = tp->t_maxopd - optlen - ipoptlen;
+ 			sendalot = 1;
+ 		}
+-	} else
++	} else {
+ 		tso = 0;
++#ifdef GSO
++		gso = 0;
++#endif /* GSO */
++	}
+ 
+ 	KASSERT(len + hdrlen + ipoptlen <= IP_MAXPACKET,
+ 	    ("%s: len > IP_MAXPACKET", __func__));
+@@ -1090,6 +1141,16 @@ send:
+ 		m->m_pkthdr.csum_flags = CSUM_TCP_IPV6;
+ 		th->th_sum = in6_cksum_pseudo(ip6, sizeof(struct tcphdr) +
+ 		    optlen + len, IPPROTO_TCP, 0);
++#ifdef GSO
++		if (gso) {
++			/*
++			 * If GSO is enabled and required, set the type
++			 * (coded in csum_flags) and the segment size.
++			 */
++			m->m_pkthdr.csum_flags |= GSO_TO_CSUM(GSO_TCP6);
++			m->m_pkthdr.tso_segsz = tp->t_maxopd - optlen;
++		}
++#endif /* GSO */
+ 	}
+ #endif
+ #if defined(INET6) && defined(INET)
+@@ -1100,7 +1161,16 @@ send:
+ 		m->m_pkthdr.csum_flags = CSUM_TCP;
+ 		th->th_sum = in_pseudo(ip->ip_src.s_addr, ip->ip_dst.s_addr,
+ 		    htons(sizeof(struct tcphdr) + IPPROTO_TCP + len + optlen));
+-
++#ifdef GSO
++		if (gso) {
++			/*
++			 * If GSO is enabled and required, set the type
++			 * (coded in csum_flags) and the segment size.
++			 */
++			m->m_pkthdr.csum_flags |= GSO_TO_CSUM(GSO_TCP4);
++			m->m_pkthdr.tso_segsz = tp->t_maxopd - optlen;
++		}
++#endif /* GSO */
+ 		/* IP version must be set here for ipv4/ipv6 checking later */
+ 		KASSERT(ip->ip_v == IPVERSION,
+ 		    ("%s: IP version incorrect: %d", __func__, ip->ip_v));
+diff --git a/sys/netinet/tcp_subr.c b/sys/netinet/tcp_subr.c
+index ac0aad3..2eb3586 100644
+--- a/sys/netinet/tcp_subr.c
++++ b/sys/netinet/tcp_subr.c
+@@ -65,6 +65,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/if.h>
+ #include <net/if_var.h>
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/cc.h>
+ #include <netinet/in.h>
+@@ -1820,6 +1823,12 @@ tcp_maxmtu(struct in_conninfo *inc, struct tcp_ifcap *cap)
+ 				cap->ifcap |= CSUM_TSO;
+ 				cap->tsomax = ifp->if_hw_tsomax;
+ 			}
++#ifdef GSO
++			if (IF_GSO(ifp)->enable) {
++				cap->ifcap |= CSUM_GSO_MASK;
++				cap->gsomax = IF_GSO(ifp)->max_burst;
++			}
++#endif /* GSO */
+ 		}
+ 		RTFREE(sro.ro_rt);
+ 	}
+@@ -1859,6 +1868,12 @@ tcp_maxmtu6(struct in_conninfo *inc, struct tcp_ifcap *cap)
+ 				cap->ifcap |= CSUM_TSO;
+ 				cap->tsomax = ifp->if_hw_tsomax;
+ 			}
++#ifdef GSO
++			if (IF_GSO(ifp)->enable) {
++				cap->ifcap |= CSUM_GSO_MASK;
++				cap->gsomax = IF_GSO(ifp)->max_burst;
++			}
++#endif /* GSO */
+ 		}
+ 		RTFREE(sro6.ro_rt);
+ 	}
+diff --git a/sys/netinet/tcp_var.h b/sys/netinet/tcp_var.h
+index 5163f6e..f0350ef 100644
+--- a/sys/netinet/tcp_var.h
++++ b/sys/netinet/tcp_var.h
+@@ -201,7 +201,7 @@ struct tcpcb {
+ 
+ 	u_int	t_tsomax;		/* tso burst length limit */
+ 
+-	uint32_t t_ispare[8];		/* 5 UTO, 3 TBD */
++	uint32_t t_ispare[8];		/* 5 UTO, 1 GSO, 2 TBD */
+ 	void	*t_pspare2[4];		/* 1 TCP_SIGNATURE, 3 TBD */
+ 	uint64_t _pad[6];		/* 6 TBD (1-2 CC/RTT?) */
+ };
+@@ -238,6 +238,7 @@ struct tcpcb {
+ #define	TF_ECN_SND_ECE	0x10000000	/* ECN ECE in queue */
+ #define	TF_CONGRECOVERY	0x20000000	/* congestion recovery mode */
+ #define	TF_WASCRECOVERY	0x40000000	/* was in congestion recovery */
++#define	TF_GSO		0x80000000	/* GSO enable on this connection */
+ 
+ #define	IN_FASTRECOVERY(t_flags)	(t_flags & TF_FASTRECOVERY)
+ #define	ENTER_FASTRECOVERY(t_flags)	t_flags |= TF_FASTRECOVERY
+@@ -324,6 +325,9 @@ struct hc_metrics_lite {	/* must stay in sync with hc_metrics */
+ struct tcp_ifcap {
+ 	int	ifcap;
+ 	u_int	tsomax;
++#ifdef GSO
++	u_int	gsomax;
++#endif /* GSO */
+ };
+ 
+ #ifndef _NETINET_IN_PCB_H_
+diff --git a/sys/netinet/udp_usrreq.c b/sys/netinet/udp_usrreq.c
+index 5860c57..eb52d35 100644
+--- a/sys/netinet/udp_usrreq.c
++++ b/sys/netinet/udp_usrreq.c
+@@ -69,6 +69,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/if.h>
+ #include <net/if_var.h>
+ #include <net/route.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/in.h>
+ #include <netinet/in_kdtrace.h>
+@@ -156,6 +159,13 @@ VNET_PCPUSTAT_SYSINIT(udpstat);
+ SYSCTL_VNET_PCPUSTAT(_net_inet_udp, UDPCTL_STATS, stats, struct udpstat,
+     udpstat, "UDP statistics (struct udpstat, netinet/udp_var.h)");
+ 
++#ifdef GSO
++VNET_DEFINE(int, udp_do_gso) = 1;
++SYSCTL_VNET_INT(_net_inet_udp, OID_AUTO, gso, CTLFLAG_RW,
++	&VNET_NAME(udp_do_gso), 0,
++	"Enable Generic Segmentation Offload");
++#endif /* GSO */
++
+ #ifdef VIMAGE
+ VNET_PCPUSTAT_SYSUNINIT(udpstat);
+ #endif /* VIMAGE */
+@@ -1355,7 +1365,15 @@ udp_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr,
+ 		ip = (struct ip *)&ui->ui_i;
+ 		ip->ip_off |= htons(IP_DF);
+ 	}
+-
++#ifdef GSO
++	else if (V_udp_do_gso) {
++		/*
++		 * Enable the GSO only if the fragmentation
++		 * is allowed
++		 */
++		m->m_pkthdr.csum_flags |= GSO_TO_CSUM(GSO_UDP4);
++	}
++#endif /* GSO */
+ 	ipflags = 0;
+ 	if (inp->inp_socket->so_options & SO_DONTROUTE)
+ 		ipflags |= IP_ROUTETOIF;
+@@ -1387,7 +1405,7 @@ udp_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr,
+ 			faddr.s_addr = INADDR_BROADCAST;
+ 		ui->ui_sum = in_pseudo(ui->ui_src.s_addr, faddr.s_addr,
+ 		    htons((u_short)len + sizeof(struct udphdr) + pr));
+-		m->m_pkthdr.csum_flags = CSUM_UDP;
++		m->m_pkthdr.csum_flags |= CSUM_UDP;
+ 		m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
+ 	}
+ 	((struct ip *)ui)->ip_len = htons(sizeof(struct udpiphdr) + len);
+diff --git a/sys/netinet/udp_var.h b/sys/netinet/udp_var.h
+index 04b4dbb..48d0676 100644
+--- a/sys/netinet/udp_var.h
++++ b/sys/netinet/udp_var.h
+@@ -145,6 +145,12 @@ VNET_DECLARE(int, udp_cksum);
+ VNET_DECLARE(int, udp_blackhole);
+ #define	V_udp_cksum		VNET(udp_cksum)
+ #define	V_udp_blackhole		VNET(udp_blackhole)
++
++#ifdef GSO
++VNET_DECLARE(int, udp_do_gso);
++#define V_udp_do_gso		VNET(udp_do_gso)
++#endif /* GSO */
++
+ extern int			udp_log_in_vain;
+ 
+ static __inline struct inpcbinfo *
+diff --git a/sys/netinet6/ip6_output.c b/sys/netinet6/ip6_output.c
+index 6f2e892..0b52e7b 100644
+--- a/sys/netinet6/ip6_output.c
++++ b/sys/netinet6/ip6_output.c
+@@ -92,6 +92,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/route.h>
+ #include <net/pfil.h>
+ #include <net/vnet.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/in.h>
+ #include <netinet/in_var.h>
+@@ -252,6 +255,10 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
+ 	struct route_in6 *ro_pmtu = NULL;
+ 	int hdrsplit = 0;
+ 	int sw_csum, tso;
++	int gso = 0;
++#ifdef GSO
++	int gso_csum;
++#endif /* GSO */
+ 	struct m_tag *fwd_tag = NULL;
+ 
+ 	ip6 = mtod(m, struct ip6_hdr *);
+@@ -343,7 +350,13 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
+ 	plen = m->m_pkthdr.len - sizeof(*ip6);
+ 
+ 	/* If this is a jumbo payload, insert a jumbo payload option. */
++#ifdef GSO
++	/* If GSO on TCP is enable, we must not add jumbo option. */
++	gso_csum = m->m_pkthdr.csum_flags & CSUM_GSO_MASK;
++	if ((CSUM_TO_GSO(gso_csum) != GSO_TCP6) && (plen > IPV6_MAXPACKET)) {
++#else /* !GSO */
+ 	if (plen > IPV6_MAXPACKET) {
++#endif /* GSO */
+ 		if (!hdrsplit) {
+ 			if ((error = ip6_splithdr(m, &exthdrs)) != 0) {
+ 				m = NULL;
+@@ -794,16 +807,43 @@ passout:
+ 		sw_csum &= ~ifp->if_hwassist;
+ 	} else
+ 		tso = 0;
++#ifdef GSO
++	gso = gso_csum && IF_GSO(ifp)->enable
++		&& (m->m_pkthdr.len > mtu);
++	if (gso && (CSUM_TO_GSO(gso_csum) == GSO_UDP6)) {
++		/*
++		 * If the packet is not TCP, but it requires GSO, we have to
++		 * perform IP fragmentation
++		 */
++		if ((m->m_pkthdr.len > mtu) &&
++				!(opt && (opt->ip6po_flags & IP6PO_DONTFRAG))) {
++			/*
++			 * XXX-ste: we can add the frag header here
++			 */
++			m->m_pkthdr.tso_segsz = (mtu - unfragpartlen -
++					sizeof(struct ip6_frag)) & ~7;
++		} else
++			gso = 0;
++	}
++#endif /* GSO */
+ 	/*
+ 	 * If we added extension headers, we will not do TSO and calculate the
+ 	 * checksums ourselves for now.
+ 	 * XXX-BZ  Need a framework to know when the NIC can handle it, even
+ 	 * with ext. hdrs.
+ 	 */
+-	if (sw_csum & CSUM_DELAY_DATA_IPV6) {
++	if (!gso && (sw_csum & CSUM_DELAY_DATA_IPV6)) {
+ 		sw_csum &= ~CSUM_DELAY_DATA_IPV6;
+ 		in6_delayed_cksum(m, plen, sizeof(struct ip6_hdr));
+ 	}
++#ifdef GSO
++	else if (gso) {
++		/*
++		 * If GSO is required, we calculate the checksum later.
++		 */
++		gso_csum |= sw_csum & CSUM_DELAY_DATA_IPV6;
++	}
++#endif /* GSO */
+ #ifdef SCTP
+ 	if (sw_csum & CSUM_SCTP_IPV6) {
+ 		sw_csum &= ~CSUM_SCTP_IPV6;
+@@ -812,7 +852,10 @@ passout:
+ #endif
+ 	m->m_pkthdr.csum_flags &= ifp->if_hwassist;
+ 	tlen = m->m_pkthdr.len;
+-
++#ifdef GSO
++	if (gso)
++		m->m_pkthdr.csum_flags |= gso_csum;
++#endif /* GSO */
+ 	if ((opt && (opt->ip6po_flags & IP6PO_DONTFRAG)) || tso)
+ 		dontfrag = 1;
+ 	else
+@@ -822,7 +865,7 @@ passout:
+ 		error = EMSGSIZE;
+ 		goto bad;
+ 	}
+-	if (dontfrag && tlen > IN6_LINKMTU(ifp) && !tso) {	/* case 2-b */
++	if (dontfrag && tlen > IN6_LINKMTU(ifp) && !tso && !gso) {	/* case 2-b */
+ 		/*
+ 		 * Even if the DONTFRAG option is specified, we cannot send the
+ 		 * packet when the data length is larger than the MTU of the
+@@ -847,7 +890,7 @@ passout:
+ 	/*
+ 	 * transmit packet without fragmentation
+ 	 */
+-	if (dontfrag || (!alwaysfrag && tlen <= mtu)) {	/* case 1-a and 2-a */
++	if (dontfrag || gso ||  (!alwaysfrag && tlen <= mtu)) {	/* case 1-a and 2-a */
+ 		struct in6_ifaddr *ia6;
+ 
+ 		ip6 = mtod(m, struct ip6_hdr *);
+diff --git a/sys/netinet6/udp6_usrreq.c b/sys/netinet6/udp6_usrreq.c
+index 63afbef..c3f30f3 100644
+--- a/sys/netinet6/udp6_usrreq.c
++++ b/sys/netinet6/udp6_usrreq.c
+@@ -96,6 +96,9 @@ __FBSDID("$FreeBSD$");
+ #include <net/if_var.h>
+ #include <net/if_types.h>
+ #include <net/route.h>
++#ifdef GSO
++#include <net/gso.h>
++#endif /* GSO */
+ 
+ #include <netinet/in.h>
+ #include <netinet/in_kdtrace.h>
+@@ -850,6 +853,11 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
+ 			m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
+ 		}
+ 
++#ifdef GSO
++		if (V_udp_do_gso) {
++			m->m_pkthdr.csum_flags |= GSO_TO_CSUM(GSO_UDP6);
++		}
++#endif /* GSO */
+ 		flags = 0;
+ 
+ 		UDP_PROBE(send, NULL, inp, ip6, inp, udp6);
+diff --git a/sys/sys/mbuf.h b/sys/sys/mbuf.h
+index 1a64eb0..e6eca69 100644
+--- a/sys/sys/mbuf.h
++++ b/sys/sys/mbuf.h
+@@ -408,6 +408,8 @@ void sf_ext_free(void *, void *);
+ #define	CSUM_IP6_TSO		0x00001000	/* TCP segmentation offload */
+ #define	CSUM_IP6_ISCSI		0x00002000	/* iSCSI checksum offload */
+ 
++#define	CSUM_GSO_MASK		0x000f0000	/* Generic segmentation offload (net/gso.h) */
++
+ /* Inbound checksum support where the checksum was verified by hardware. */
+ #define	CSUM_L3_CALC		0x01000000	/* calculated layer 3 csum */
+ #define	CSUM_L3_VALID		0x02000000	/* checksum is correct */
