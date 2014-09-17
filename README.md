@@ -4,14 +4,13 @@ FreeBSD: Generic Segmentation Offload (GSO)
 The use of large frames makes network communication much less demanding for the CPU. Yet, backward compatibility and slow links requires the use of 1500 byte or smaller frames.
 Modern NICs with hardware TCP segmentation offloading (TSO) address this problem. However, a generic software version (GSO) provided by the OS has reason to exist, for use on paths with no suitable hardware, such as between virtual machines or with older or buggy NICs.
 
-A lot of the savings is provided by crossing the network stack once rather than many times for each large packet, but this saving can be obtained without hardware support. In addition, this mechanism can also be extended to protocols that require IP fragmentation, such as UDP.
-In order to reduce the CPU overhead, the idea is to postpone the TCP segmentation or IP fragmentation as late as possible. This goal can be reached performing the segmentation within the device driver, but this requires changing every device driver. Therefore, the best approach is to segment just before the packet is passed to the driver (in <code>ether_output()</code>).
+Much of the advantage of TSO comes from crossing the network stack only once per (large) segment instead of once per 1500-byte frame. GSO does the same both for segmentation (TCP) and fragmentation (UDP) by doing these operations as late as possible. Ideally, this could be done within the device driver, but that would require modifications to all drivers. A more convenient, similarly effective approach is to segment just before the packet is passed to the driver (in <code>ether_output()</code>)
 
-This preliminary implementation supports TCP, UDP on IPv4/IPv6.
-For TCP, when a packet is created, if the GSO is active, it may be larger than the MTU, in this case the super-packet is marked with a flag (contained in <code>m_pkthdr.csum_flags</code>)  which guarantees that it is divided into smaller packets just before calling the device driver. In this way the functions that create the headers for layers TCP, IP and Ethernet are crossed once. Finally, the super-packet headers are copied and adjusted in all packets after performing the segmentation of the payload. 
-A TCP packet can be divided into smaller packets without performing IP fragmentation, because TCP is a stream-oriented protocol. Instead, for UDP, IP fragmentation is required. However, also in this case, the fragmentation can be delayed and performed just before calling the device driver. In this way, the Ethernet layer is traversed only once, and the Ethernet header, the same for all, is simply copied into all fragments.
+Our preliminary implementation supports TCP and UDP on IPv4/IPv6; it only intercepts packets large than the MTU (others are left unchanged), and only when GSO is marked as enabled for the interface.
 
-The experiments performed with TCP provide significant results if the receiver can perform aggregation hardware or software (RSC or LRO). We also noticed that by lowering the clock frequency of the transmitter, the speedup increases. This occurs because with maximum frequency, the system is able to saturate the link. Also with UDP traffic, we can notice a speedup given by the GSO.
+Segments larger than the MTU are not split in <code>tcp_output()</code>, <code>udp_output()</code>, or <code>ip_output()</code>, but marked with a flag (contained in <code>m_pkthdr.csum_flags</code>), which is processed by <code>ether_output()</code> just before calling the device driver.
+
+<code>ether_output()</code>, through <code>gso_dispatch()</code>, splits the large frame as needed, creating headers and possibly doing checksums if not supported by the hardware.
 
 Our preliminary implementation, depending on CPU speed, shows up to 95% speedup compared to segmentation done in the TCP/IPv4 stack, saturating a 10 Gbit link at 2 GHz with checksum offloading [Tab. 1].
 
@@ -62,6 +61,7 @@ In https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD
 * Virtual Machine
 
 ##Experiments
+In experiments agains an LRO-enabled receiver (otherwise TSO/GSO are ineffective) we have seen the following performance, taken at different clock speeds (because at top speeds the 10G link becomes the bottleneck).
 
 * Test Date: Sep 9, 2014
 * Transmitter: FreeBSD 11-CURRENT - CPU i7-870 at 2.93 GHz + Turboboost, Intel 10 Gbit NIC.
