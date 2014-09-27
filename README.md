@@ -68,6 +68,7 @@ In experiments agains an LRO-enabled receiver (otherwise TSO/GSO are ineffective
 * Receiver: Linux 3.12.8 - CPU i7-3770K at 3.50GHz + Turboboost, Intel 10 Gbit NIC.
 * Benchmark tool: netperf 2.6.0
 
+![alt tag](https://raw.githubusercontent.com/stefano-garzarella/freebsd-gso/master/experiments/exp_TCP_IP4.png)
 
 | Freq. |   TSO   |   GSO   |   none   |  Speedup  |
 | :----  | :-----: | :----:  | :----:   | -------: |
@@ -82,6 +83,8 @@ Tab.1 TCP/IPv4 packets (checksum offloading enabled)
 
 -----------
 
+![alt tag](https://raw.githubusercontent.com/stefano-garzarella/freebsd-gso/master/experiments/exp_TCP_IP6.png)
+
 | Freq. |   TSO   |   GSO   |   none   |  Speedup  |
 | :----  | :-----: | :----:  | :----:   | -------: |
 | *[GHz]* | *[Gbps]* | *[Gbps]*| *[Gbps]* | **GSO-none** |
@@ -95,6 +98,8 @@ Tab.2 TCP/IPv6 packets (checksum offloading enabled)
 
 -----------
 
+![alt tag](https://raw.githubusercontent.com/stefano-garzarella/freebsd-gso/master/experiments/exp_UDP_IP4.png)
+
 | Freq. |   GSO   |   none   |  Speedup  |
 | :----  | :----:  | :----:   | -------: |
 | *[GHz]* | *[Gbps]*| *[Gbps]* | **GSO-none** |
@@ -107,6 +112,8 @@ Tab.2 TCP/IPv6 packets (checksum offloading enabled)
 Tab.3 UDP/IPv4 packets
 
 -----------
+
+![alt tag](https://raw.githubusercontent.com/stefano-garzarella/freebsd-gso/master/experiments/exp_UDP_IP6.png)
 
 | Freq. |   GSO   |   none   |  Speedup  |
 | :----  | :----:  | :----:   | -------: |
