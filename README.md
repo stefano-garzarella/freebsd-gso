@@ -1,6 +1,9 @@
 FreeBSD: Generic Segmentation Offload (GSO)
 ===========
 
+2014/09/28 - [**EuroBSDcon2014 Slide**](https://github.com/stefano-garzarella/freebsd-gso/blob/master/slides/20140928_GSO_EuroBSDcon_2014.pdf?raw=true)
+
+-----------
 The use of large frames makes network communication much less demanding for the CPU. Yet, backward compatibility and slow links requires the use of 1500 byte or smaller frames.
 Modern NICs with hardware TCP segmentation offloading (TSO) address this problem. However, a generic software version (GSO) provided by the OS has reason to exist, for use on paths with no suitable hardware, such as between virtual machines or with older or buggy NICs.
 
