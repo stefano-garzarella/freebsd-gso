@@ -1,7 +1,7 @@
 FreeBSD: Generic Segmentation Offload (GSO)
 ===========
 
-2014/09/28 - [**EuroBSDcon2014 Slide**](https://github.com/stefano-garzarella/freebsd-gso/blob/master/slides/20140928_GSO_EuroBSDcon_2014.pdf?raw=true)
+2014/09/28 - [**EuroBSDcon2014 Slides**](https://github.com/stefano-garzarella/freebsd-gso/blob/master/slides/20140928_GSO_EuroBSDcon_2014.pdf?raw=true)
 
 -----------
 The use of large frames makes network communication much less demanding for the CPU. Yet, backward compatibility and slow links requires the use of 1500 byte or smaller frames.
