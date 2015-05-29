@@ -31,7 +31,7 @@ In this repo you can find:
 	* PicoBSD 10-stable
 	* PicoBSD 9-stable 
 
-At https://github.com/stefano-garzarella/freebsd-gso-src you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
+At https://github.com/stefano-garzarella/freebsd you can get the FreeBSD source with GSO support [various branch for FreeBSD current (gso-master), 10-stable (gso-10), 9-stable (gso-9)].
 
 ##How to use GSO
 
